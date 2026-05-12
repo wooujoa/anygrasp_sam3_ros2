@@ -56,6 +56,9 @@ class RankedGrasp:
     radial_score: float = 0.0
     mid_score: float = 0.0
     bg_clearance: float = float('inf')
+    bg_collision_count: int = 0
+    target_dist: float = float('inf')
+    target_ok: bool = False
     local_span: float = 0.0
     local_width_limit: float = 0.0
     width_gate_ok: bool = True
@@ -104,19 +107,44 @@ class AnyGraspFromTopicNode(Node):
         self.declare_parameter('radial_score_weight', 0.60)
         self.declare_parameter('mask_score_bonus', 0.60)
         self.declare_parameter('bg_clearance_weight', 0.20)
-        self.declare_parameter('min_bg_clearance', 0.0)
+        self.declare_parameter('min_bg_clearance', 0.012)
         self.declare_parameter('enable_local_width_gate', True)
-        self.declare_parameter('enable_object_width_gate', True)
+        self.declare_parameter('enable_object_width_gate', False)
         self.declare_parameter('width_safety_margin', 0.010)
         self.declare_parameter('object_width_ratio_limit', 1.00)
         self.declare_parameter('rank_threshold', 0.05)
         self.declare_parameter('prefer_mid_body', True)
         self.declare_parameter('prefer_side_grasp', True)
 
+        # Target/background hard filtering.
+        # AnyGrasp may generate grasps from the full scene, but execution must be
+        # restricted to the SAM3-selected target. Background is used as obstacles.
+        self.declare_parameter('hard_filter_to_target', True)
+        self.declare_parameter('require_target_data', True)
+        self.declare_parameter('target_filter_use_mask', True)
+        self.declare_parameter('target_filter_use_object_pc', True)
+        self.declare_parameter('target_filter_radius', 0.030)
+        self.declare_parameter('hard_reject_background', True)
+        self.declare_parameter('use_gripper_volume_collision', True)
+        self.declare_parameter('max_background_collision_points', 0)
+        self.declare_parameter('background_collision_margin', 0.006)
+        self.declare_parameter('background_collision_sample_limit', 50000)
+        self.declare_parameter('collision_use_fixed_width', True)
+        self.declare_parameter('collision_gripper_width', 0.10)
+        self.declare_parameter('collision_finger_length', 0.055)
+        self.declare_parameter('collision_palm_depth', 0.030)
+        self.declare_parameter('collision_tail_length', 0.020)
+        self.declare_parameter('collision_finger_thickness', 0.010)
+        self.declare_parameter('verbose_filter_log', True)
+
         # outputs
         self.declare_parameter('best_grasp_topic', '/anygrasp/best_grasp')
         self.declare_parameter('best_pose_raw_topic', '/anygrasp/best_pose_raw')
         self.declare_parameter('best_width_topic', '/anygrasp/best_width')
+        # Raw AnyGrasp confidence for the selected best grasp.
+        # This remains an internal scalar topic. The final custom ObjectGrasp
+        # is published only by the calib node after frame conversion.
+        self.declare_parameter('best_score_topic', '/anygrasp/best_score')
         self.declare_parameter('grasps_topic', '/anygrasp/grasps')
         self.declare_parameter('markers_topic', '/anygrasp/grasp_markers')
         self.declare_parameter('all_markers_topic', '/anygrasp/all_grasp_markers')
@@ -180,6 +208,24 @@ class AnyGraspFromTopicNode(Node):
         self.prefer_mid_body = bool(self.get_parameter('prefer_mid_body').value)
         self.prefer_side_grasp = bool(self.get_parameter('prefer_side_grasp').value)
 
+        self.hard_filter_to_target = bool(self.get_parameter('hard_filter_to_target').value)
+        self.require_target_data = bool(self.get_parameter('require_target_data').value)
+        self.target_filter_use_mask = bool(self.get_parameter('target_filter_use_mask').value)
+        self.target_filter_use_object_pc = bool(self.get_parameter('target_filter_use_object_pc').value)
+        self.target_filter_radius = float(self.get_parameter('target_filter_radius').value)
+        self.hard_reject_background = bool(self.get_parameter('hard_reject_background').value)
+        self.use_gripper_volume_collision = bool(self.get_parameter('use_gripper_volume_collision').value)
+        self.max_background_collision_points = int(self.get_parameter('max_background_collision_points').value)
+        self.background_collision_margin = float(self.get_parameter('background_collision_margin').value)
+        self.background_collision_sample_limit = int(self.get_parameter('background_collision_sample_limit').value)
+        self.collision_use_fixed_width = bool(self.get_parameter('collision_use_fixed_width').value)
+        self.collision_gripper_width = float(self.get_parameter('collision_gripper_width').value)
+        self.collision_finger_length = float(self.get_parameter('collision_finger_length').value)
+        self.collision_palm_depth = float(self.get_parameter('collision_palm_depth').value)
+        self.collision_tail_length = float(self.get_parameter('collision_tail_length').value)
+        self.collision_finger_thickness = float(self.get_parameter('collision_finger_thickness').value)
+        self.verbose_filter_log = bool(self.get_parameter('verbose_filter_log').value)
+
         self.marker_lifetime_sec = float(self.get_parameter('marker_lifetime_sec').value)
         self.marker_alpha = float(self.get_parameter('marker_alpha').value)
         self.marker_topk = int(self.get_parameter('marker_topk').value)
@@ -220,6 +266,7 @@ class AnyGraspFromTopicNode(Node):
         self.body_radius: float = 0.02
         self.object_width_est: float = 0.0
         self.header = None
+        self.last_filter_stats = {}
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -237,6 +284,7 @@ class AnyGraspFromTopicNode(Node):
         self.best_pub = self.create_publisher(PoseStamped, self.get_parameter('best_grasp_topic').value, 10)
         self.best_pose_raw_pub = self.create_publisher(PoseStamped, self.get_parameter('best_pose_raw_topic').value, 10)
         self.best_width_pub = self.create_publisher(Float32, self.get_parameter('best_width_topic').value, 10)
+        self.best_score_pub = self.create_publisher(Float32, self.get_parameter('best_score_topic').value, 10)
         self.grasps_pub = self.create_publisher(PoseArray, self.get_parameter('grasps_topic').value, 10)
         self.markers_pub = self.create_publisher(MarkerArray, self.get_parameter('markers_topic').value, 10)
         self.all_markers_pub = self.create_publisher(MarkerArray, self.get_parameter('all_markers_topic').value, 10)
@@ -252,9 +300,18 @@ class AnyGraspFromTopicNode(Node):
         self.get_logger().info(f'target_mask_topic={self.target_mask_topic}')
         self.get_logger().info(f'use_scene_cloud={self.use_scene_cloud}')
         self.get_logger().info(f'best_pose_raw_topic={self.get_parameter("best_pose_raw_topic").value}')
+        self.get_logger().info(f'best_width_topic={self.get_parameter("best_width_topic").value}')
+        self.get_logger().info(f'best_score_topic={self.get_parameter("best_score_topic").value}')
         self.get_logger().info(f'enable_local_width_gate={self.enable_local_width_gate}')
         self.get_logger().info(f'enable_object_width_gate={self.enable_object_width_gate}')
         self.get_logger().info(f'width_safety_margin={self.width_safety_margin:.4f}')
+        self.get_logger().info(f'hard_filter_to_target={self.hard_filter_to_target}')
+        self.get_logger().info(f'require_target_data={self.require_target_data}')
+        self.get_logger().info(f'target_filter_radius={self.target_filter_radius:.4f}')
+        self.get_logger().info(f'hard_reject_background={self.hard_reject_background}')
+        self.get_logger().info(f'use_gripper_volume_collision={self.use_gripper_volume_collision}')
+        self.get_logger().info(f'min_bg_clearance={self.min_bg_clearance:.4f}')
+        self.get_logger().info(f'background_collision_margin={self.background_collision_margin:.4f}')
 
     def _append_sdk_path(self, sdk_root: str) -> None:
         if not os.path.isdir(sdk_root):
@@ -295,6 +352,11 @@ class AnyGraspFromTopicNode(Node):
             if pts.shape[0] >= 20:
                 self.object_points = pts
                 self.update_body_model()
+                if self.verbose_filter_log:
+                    self.get_logger().info(
+                        f'target/object cloud updated: points={pts.shape[0]} '
+                        f'width_est={self.object_width_est:.4f}m'
+                    )
         except Exception as exc:
             self.get_logger().warn(f'object cloud parse failed: {repr(exc)}')
 
@@ -302,6 +364,8 @@ class AnyGraspFromTopicNode(Node):
         try:
             pts, _ = self.pointcloud2_to_numpy(msg)
             self.background_points = pts if pts.shape[0] > 0 else None
+            if self.verbose_filter_log:
+                self.get_logger().info(f'background cloud updated: points={pts.shape[0]}')
         except Exception as exc:
             self.get_logger().warn(f'background cloud parse failed: {repr(exc)}')
 
@@ -368,9 +432,18 @@ class AnyGraspFromTopicNode(Node):
                 return
 
             ranked_all = self.rank_grasps(grasps)
+            if len(ranked_all) == 0:
+                stats = getattr(self, 'last_filter_stats', {})
+                self.get_logger().warn(
+                    'No grasps survived target/background hard filters. '
+                    f'stats={stats}'
+                )
+                self.publish_empty_markers(msg.header)
+                return
+
             width_ok_count = sum(1 for g in ranked_all if g.width_gate_ok)
             if self.enable_local_width_gate and width_ok_count == 0:
-                self.get_logger().warn('All grasps rejected by local width gate. Object is too wide locally for the gripper.')
+                self.get_logger().warn('All surviving target grasps are rejected by local width gate. Object may be too wide locally for the gripper.')
             ranked = [g for g in ranked_all if g.rank >= self.rank_threshold]
             if len(ranked) == 0:
                 self.get_logger().warn('All grasps removed after ranking threshold. Falling back to raw scores.')
@@ -389,6 +462,25 @@ class AnyGraspFromTopicNode(Node):
             self.publish_empty_markers(msg.header if hasattr(msg, 'header') else None)
 
     def rank_grasps(self, grasps: Sequence[RankedGrasp], force_keep: bool = False) -> List[RankedGrasp]:
+        """
+        Rank grasps while enforcing the intended pipeline semantics:
+          - target/object_pc or SAM3 mask defines what can be grasped
+          - background_pc defines obstacles that must not be grasped/collided with
+
+        force_keep only bypasses soft ranking penalties. It does NOT bypass
+        target/background hard filters, because those protect against grasping
+        the wrong object.
+        """
+        stats = {
+            'raw': len(grasps),
+            'target_reject': 0,
+            'background_reject': 0,
+            'width_soft_reject': 0,
+            'kept': 0,
+            'target_data_available': int(self.target_data_available()),
+            'background_available': int(self.background_points is not None and self.background_points.shape[0] > 0),
+        }
+
         ranked: List[RankedGrasp] = []
         for grasp in grasps:
             g = RankedGrasp(
@@ -397,7 +489,14 @@ class AnyGraspFromTopicNode(Node):
                 translation=grasp.translation.copy(),
                 rotation_matrix=grasp.rotation_matrix.copy(),
             )
-            g.mask_ok = self.is_inside_mask(g.translation)
+
+            # 1) Target membership hard filter
+            g.target_ok, g.mask_ok, g.target_dist = self.target_membership(g.translation)
+            if self.hard_filter_to_target and not g.target_ok:
+                stats['target_reject'] += 1
+                continue
+
+            # 2) Compute axes using target object geometry only
             local_pts = self.local_object_points(g.translation)
             opening_axis, approach_axis, body_axis = self.infer_axes(g, local_pts)
             g.opening_axis = opening_axis
@@ -416,11 +515,22 @@ class AnyGraspFromTopicNode(Node):
                 g.radial_score = 0.0
                 g.mid_score = 0.0
 
+            # 3) Width/local geometry gate on target object only
             g.width_match, g.local_span = self.width_match(local_pts, g.translation, opening_axis, g.width)
             g.local_width_limit = max(0.0, float(self.get_parameter('max_gripper_width').value) - self.width_safety_margin)
             g.width_gate_ok = (not self.enable_local_width_gate) or (g.local_span <= g.local_width_limit)
-            g.bg_clearance = self.background_clearance(g.translation)
 
+            # 4) Background obstacle hard filter
+            g.bg_clearance = self.background_clearance(g.translation)
+            g.bg_collision_count = self.background_collision_count(g)
+
+            bg_too_close = g.bg_clearance < self.min_bg_clearance
+            bg_in_gripper = g.bg_collision_count > self.max_background_collision_points
+            if self.hard_reject_background and (bg_too_close or bg_in_gripper):
+                stats['background_reject'] += 1
+                continue
+
+            # 5) Final ranking after hard filters
             rank = float(g.score)
             if g.mask_ok:
                 rank += self.mask_score_bonus
@@ -435,9 +545,9 @@ class AnyGraspFromTopicNode(Node):
             rank += self.bg_clearance_weight * min(g.bg_clearance, 0.05)
 
             if (not force_keep) and self.body_axis is not None:
-                # hard suppress physically odd candidates for bottle side grasping
                 if not g.width_gate_ok:
                     rank -= 4.0
+                    stats['width_soft_reject'] += 1
                 if g.approach_perp < 0.45:
                     rank -= 1.25
                 if g.opening_perp < 0.55:
@@ -446,16 +556,67 @@ class AnyGraspFromTopicNode(Node):
                     rank -= 0.45
                 if g.radial_score < 0.10:
                     rank -= 0.45
-                if g.bg_clearance < self.min_bg_clearance:
-                    rank -= 0.50
 
             g.rank = rank
             ranked.append(g)
+
+        stats['kept'] = len(ranked)
+        self.last_filter_stats = stats
+        if self.verbose_filter_log:
+            self.get_logger().info(
+                '[filter] '
+                f"raw={stats['raw']} kept={stats['kept']} "
+                f"target_reject={stats['target_reject']} "
+                f"background_reject={stats['background_reject']} "
+                f"width_soft={stats['width_soft_reject']} "
+                f"target_data={stats['target_data_available']} "
+                f"background_data={stats['background_available']}"
+            )
         return ranked
+
+    def target_data_available(self) -> bool:
+        has_mask = self.target_filter_use_mask and self.target_mask is not None and self.camera_info is not None
+        has_object = (
+            self.target_filter_use_object_pc
+            and self.object_points is not None
+            and self.object_points.shape[0] > 0
+        )
+        return bool(has_mask or has_object)
+
+    def target_membership(self, xyz: np.ndarray) -> Tuple[bool, bool, float]:
+        """
+        Returns: (target_ok, mask_ok, target_dist).
+        target_ok is true if the grasp contact/center belongs to the selected
+        SAM3 target by either projected mask membership or 3D object_pc proximity.
+        """
+        mask_ok = False
+        target_dist = float('inf')
+        data_available = False
+
+        if self.target_filter_use_mask and self.target_mask is not None and self.camera_info is not None:
+            data_available = True
+            mask_ok = self.is_inside_mask(xyz)
+
+        if self.target_filter_use_object_pc and self.object_points is not None and self.object_points.shape[0] > 0:
+            data_available = True
+            target_dist = self.distance_to_object(xyz)
+
+        if not data_available:
+            return (not self.require_target_data), mask_ok, target_dist
+
+        object_ok = target_dist <= self.target_filter_radius
+        target_ok = bool(mask_ok or object_ok)
+        return target_ok, mask_ok, target_dist
+
+    def distance_to_object(self, xyz: np.ndarray) -> float:
+        if self.object_points is None or self.object_points.shape[0] == 0:
+            return float('inf')
+        d = np.linalg.norm(self.object_points - xyz[None, :], axis=1)
+        return float(np.min(d))
 
     def is_inside_mask(self, xyz: np.ndarray) -> bool:
         if self.target_mask is None or self.camera_info is None:
-            return True
+            return False
         u, v = self.project_point(xyz)
         if u is None:
             return False
@@ -550,6 +711,70 @@ class AnyGraspFromTopicNode(Node):
         d = np.linalg.norm(self.background_points - center[None, :], axis=1)
         return float(np.min(d))
 
+    def background_collision_count(self, grasp: RankedGrasp) -> int:
+        """
+        Conservative background collision check using a simplified parallel-jaw
+        gripper volume. This treats background_pc as obstacles. Target/object_pc
+        is intentionally not used here.
+        """
+        if not self.use_gripper_volume_collision:
+            return 0
+        if self.background_points is None or self.background_points.shape[0] == 0:
+            return 0
+        if grasp.opening_axis is None or grasp.approach_axis is None or grasp.body_axis is None:
+            return 0
+
+        pts = self.background_points
+        limit = int(self.background_collision_sample_limit)
+        if limit > 0 and pts.shape[0] > limit:
+            idx = np.linspace(0, pts.shape[0] - 1, limit).astype(np.int64)
+            pts = pts[idx]
+
+        opening = grasp.opening_axis / max(np.linalg.norm(grasp.opening_axis), 1e-8)
+        approach = grasp.approach_axis / max(np.linalg.norm(grasp.approach_axis), 1e-8)
+        body = grasp.body_axis / max(np.linalg.norm(grasp.body_axis), 1e-8)
+
+        rel = pts - grasp.translation[None, :]
+        x = rel @ opening
+        y = rel @ approach
+        z = rel @ body
+
+        margin = max(0.0, float(self.background_collision_margin))
+        jaw_width = float(self.collision_gripper_width) if self.collision_use_fixed_width else max(0.0, float(grasp.width))
+        jaw_width = max(0.0, jaw_width)
+        half_w = 0.5 * jaw_width
+        finger_len = max(0.001, float(self.collision_finger_length))
+        palm_depth = max(0.0, float(self.collision_palm_depth))
+        tail_len = max(0.0, float(self.collision_tail_length))
+        thick = max(0.001, float(self.collision_finger_thickness))
+
+        left_finger = (
+            (np.abs(x + half_w) <= thick + margin)
+            & (y >= -palm_depth - margin)
+            & (y <= finger_len - palm_depth + margin)
+            & (np.abs(z) <= thick + margin)
+        )
+        right_finger = (
+            (np.abs(x - half_w) <= thick + margin)
+            & (y >= -palm_depth - margin)
+            & (y <= finger_len - palm_depth + margin)
+            & (np.abs(z) <= thick + margin)
+        )
+        palm = (
+            (np.abs(x) <= half_w + thick + margin)
+            & (y >= -palm_depth - tail_len - margin)
+            & (y <= -palm_depth + thick + margin)
+            & (np.abs(z) <= thick + margin)
+        )
+        close_core = (
+            (np.abs(x) <= half_w + margin)
+            & (np.abs(y) <= max(finger_len, palm_depth) + margin)
+            & (np.abs(z) <= thick + margin)
+        )
+
+        collision = left_finger | right_finger | palm | close_core
+        return int(np.count_nonzero(collision))
+
     def log_top_candidates(self, grasps: Sequence[RankedGrasp], topk: int = 10) -> None:
         self.get_logger().info(f'[final] top {min(topk, len(grasps))} candidates:')
         for i, g in enumerate(grasps[:topk], start=1):
@@ -557,9 +782,11 @@ class AnyGraspFromTopicNode(Node):
             self.get_logger().info(
                 f'  #{i:02d} score={g.score:.4f} rank={g.rank:.4f} width={100.0*g.width:.2f}cm '
                 f'local_span={100.0*g.local_span:.2f}cm gate={int(g.width_gate_ok)} limit={100.0*g.local_width_limit:.2f}cm '
-                f'mask={int(g.mask_ok)} body_align={g.body_align:.3f} open_perp={g.opening_perp:.3f} '
+                f'target={int(g.target_ok)} mask={int(g.mask_ok)} target_d={100.0*g.target_dist:.1f}cm '
+                f'body_align={g.body_align:.3f} open_perp={g.opening_perp:.3f} '
                 f'appr_perp={g.approach_perp:.3f} width_match={g.width_match:.3f} '
-                f'radial={g.radial_score:.3f} mid={g.mid_score:.3f} bg={g.bg_clearance:.3f} '
+                f'radial={g.radial_score:.3f} mid={g.mid_score:.3f} '
+                f'bg={g.bg_clearance:.3f} bg_col={g.bg_collision_count} '
                 f'pos=({t[0]:.3f},{t[1]:.3f},{t[2]:.3f})'
             )
 
@@ -650,6 +877,10 @@ class AnyGraspFromTopicNode(Node):
         width_msg.data = float(best.width)
         self.best_width_pub.publish(width_msg)
 
+        score_msg = Float32()
+        score_msg.data = float(best.score)
+        self.best_score_pub.publish(score_msg)
+
         self.publish_best_contact_point(best.translation, header)
         self.publish_best_contact_marker(best, header)
         self.publish_best_marker(best, header)
@@ -683,6 +914,10 @@ class AnyGraspFromTopicNode(Node):
         self.markers_pub.publish(markers)
         self.all_markers_pub.publish(markers)
         self.best_axes_pub.publish(markers)
+
+        delete_best = self.make_delete_all_marker(header)
+        self.best_marker_pub.publish(delete_best)
+        self.best_contact_marker_pub.publish(delete_best)
 
     def make_delete_all_marker(self, header) -> Marker:
         marker = Marker()
