@@ -36,6 +36,7 @@ from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Point, PointStamped,
 from sensor_msgs.msg import PointCloud2, CameraInfo
 from sensor_msgs_py import point_cloud2
 from visualization_msgs.msg import Marker, MarkerArray
+import tf2_ros
 
 
 @dataclass
@@ -57,6 +58,13 @@ class RankedGrasp:
     mid_score: float = 0.0
     bg_clearance: float = float('inf')
     bg_collision_count: int = 0
+    okrobot_theta: float = 0.0
+    okrobot_score: float = 0.0
+    horizontal_score: float = 0.0
+    arm_side_dot: float = 0.0
+    arm_side_ok: bool = True
+    top_down_dot: float = 0.0
+    top_down_score: float = 0.0
     target_dist: float = float('inf')
     target_ok: bool = False
     local_span: float = 0.0
@@ -115,6 +123,78 @@ class AnyGraspFromTopicNode(Node):
         self.declare_parameter('rank_threshold', 0.05)
         self.declare_parameter('prefer_mid_body', True)
         self.declare_parameter('prefer_side_grasp', True)
+
+        # OK-Robot style grasp heuristic.
+        # OK-Robot filters grasps by the language mask and then ranks with
+        # a graspness-vs-horizontal-grasp heuristic. In practice, for this
+        # camera-frame node, we make the floor normal configurable.
+        self.declare_parameter('enable_okrobot_heuristic', True)
+        self.declare_parameter('okrobot_rank_weight', 1.0)
+        self.declare_parameter('okrobot_theta_penalty_divisor', 10.0)
+        self.declare_parameter('okrobot_theta_power', 4.0)
+        self.declare_parameter('okrobot_floor_normal_camera', [0.0, 1.0, 0.0])
+        self.declare_parameter('okrobot_use_horizontal_theta', True)
+        self.declare_parameter('okrobot_keep_existing_shape_terms', False)
+        self.declare_parameter('okrobot_shape_terms_weight', 0.15)
+
+        # Arm-side feasibility filter in base_link.
+        # IMPORTANT:
+        # This is a hard reject filter, not a ranking bonus.
+        # Right arm: reject grasps whose gripper face axis points to robot-right (-Y).
+        # Left arm : reject grasps whose gripper face axis points to robot-left  (+Y).
+        # It does NOT force the gripper to look strongly toward the opposite side.
+        self.declare_parameter('enable_arm_side_filter', True)
+        self.declare_parameter('arm_side', 'right')  # 'right' or 'left'
+        # Deprecated old name kept for launch compatibility. Not used for scoring.
+        self.declare_parameter('arm_side_min_dot', 0.0)
+        # Reject only when dot with the desired inward side is smaller than -this value.
+        # Example for right arm: desired is +Y. If face_axis_y < -0.05, it is looking right and rejected.
+        self.declare_parameter('arm_side_reject_dot', 0.05)
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('base_frame_candidates', ['base_link', 'lift_link', 'arm_base_link'])
+        self.declare_parameter('gripper_frame', 'gripper_r_rh_p12_rn_base')
+        self.declare_parameter('camera_frame', 'camera_r_color_optical_frame')
+        self.declare_parameter('tf_timeout_sec', 0.05)
+        self.declare_parameter('apply_anygrasp_pose_frame_alignment_for_filter', True)
+        self.declare_parameter('auto_flip_pose_z_180_if_x_points_down_for_filter', True)
+        self.declare_parameter('x_axis_downward_flip_threshold_for_filter', 0.0)
+        self.declare_parameter('gripper_face_axis_index', 2)  # final pose local z-axis by default
+        self.declare_parameter('gripper_face_axis_sign', 1.0)
+        self.declare_parameter('arm_side_filter_penalty', 6.0)
+        self.declare_parameter('hard_reject_wrong_arm_side', True)
+
+        # Top-down preference for shelf/table objects.
+        # This is a ranking bonus only, not a hard filter.
+        # It prefers gripper-facing direction from above to below, because
+        # bottom-up approaches can collide with the shelf/table surface.
+        self.declare_parameter('enable_top_down_bonus', True)
+        self.declare_parameter('top_down_bonus_weight', 0.35)
+        self.declare_parameter('top_down_axis_index', 2)
+        self.declare_parameter('top_down_axis_sign', 1.0)
+        self.declare_parameter('top_down_desired_z_sign', -1.0)  # -1: above -> below, +1: below -> above
+        self.declare_parameter('top_down_penalize_bottom_up', False)
+        self.declare_parameter('bottom_up_penalty_weight', 0.20)
+
+        # Hand-eye copied from the right-arm calibration node.
+        # Used only to predict final grasp orientation for ranking/filtering.
+        self.T_cam_to_link7 = np.array([
+            [ 0.9954,  0.0000, -0.0958,  0.0982],
+            [ 0.0000, -1.0000,  0.0000,  0.0000],
+            [-0.0958,  0.0000, -0.9954, -0.0725],
+            [ 0.0000,  0.0000,  0.0000,  1.0000],
+        ], dtype=np.float64)
+        self.T_link7_to_gripper_base = np.eye(4, dtype=np.float64)
+        self.T_link7_to_gripper_base[:3, :3] = np.array([
+            [ 1.0,  0.0,  0.0],
+            [ 0.0, -1.0,  0.0],
+            [ 0.0,  0.0, -1.0],
+        ], dtype=np.float64)
+        self.T_link7_to_gripper_base[:3, 3] = np.array([0.0, 0.0, -0.0780], dtype=np.float64)
+        self.T_cam_to_gripper = self.T_link7_to_gripper_base @ self.T_cam_to_link7
+        self.T_pose_align_y90 = np.eye(4, dtype=np.float64)
+        self.T_pose_align_y90[:3, :3] = R.from_euler('y', 90.0, degrees=True).as_matrix()
+        self.T_pose_align_z180 = np.eye(4, dtype=np.float64)
+        self.T_pose_align_z180[:3, :3] = R.from_euler('z', 180.0, degrees=True).as_matrix()
 
         # Target/background hard filtering.
         # AnyGrasp may generate grasps from the full scene, but execution must be
@@ -208,6 +288,49 @@ class AnyGraspFromTopicNode(Node):
         self.prefer_mid_body = bool(self.get_parameter('prefer_mid_body').value)
         self.prefer_side_grasp = bool(self.get_parameter('prefer_side_grasp').value)
 
+        self.enable_okrobot_heuristic = bool(self.get_parameter('enable_okrobot_heuristic').value)
+        self.okrobot_rank_weight = float(self.get_parameter('okrobot_rank_weight').value)
+        self.okrobot_theta_penalty_divisor = max(1e-6, float(self.get_parameter('okrobot_theta_penalty_divisor').value))
+        self.okrobot_theta_power = max(1.0, float(self.get_parameter('okrobot_theta_power').value))
+        self.okrobot_floor_normal_camera = self.normalize_vec(
+            np.asarray(self.get_parameter('okrobot_floor_normal_camera').value, dtype=np.float32),
+            fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        )
+        self.okrobot_use_horizontal_theta = bool(self.get_parameter('okrobot_use_horizontal_theta').value)
+        self.okrobot_keep_existing_shape_terms = bool(self.get_parameter('okrobot_keep_existing_shape_terms').value)
+        self.okrobot_shape_terms_weight = float(self.get_parameter('okrobot_shape_terms_weight').value)
+
+        self.enable_arm_side_filter = bool(self.get_parameter('enable_arm_side_filter').value)
+        self.arm_side = str(self.get_parameter('arm_side').value).lower().strip()
+        self.arm_side_min_dot = float(self.get_parameter('arm_side_min_dot').value)
+        self.arm_side_reject_dot = abs(float(self.get_parameter('arm_side_reject_dot').value))
+        self.base_frame = self.get_parameter('base_frame').value
+        self.base_frame_candidates = list(self.get_parameter('base_frame_candidates').value)
+        self.gripper_frame = self.get_parameter('gripper_frame').value
+        self.camera_frame = self.get_parameter('camera_frame').value
+        self.tf_timeout_sec = float(self.get_parameter('tf_timeout_sec').value)
+        self.apply_anygrasp_pose_frame_alignment_for_filter = bool(self.get_parameter('apply_anygrasp_pose_frame_alignment_for_filter').value)
+        self.auto_flip_pose_z_180_if_x_points_down_for_filter = bool(self.get_parameter('auto_flip_pose_z_180_if_x_points_down_for_filter').value)
+        self.x_axis_downward_flip_threshold_for_filter = float(self.get_parameter('x_axis_downward_flip_threshold_for_filter').value)
+        self.gripper_face_axis_index = int(self.get_parameter('gripper_face_axis_index').value)
+        self.gripper_face_axis_sign = float(self.get_parameter('gripper_face_axis_sign').value)
+        self.arm_side_filter_penalty = float(self.get_parameter('arm_side_filter_penalty').value)
+        self.hard_reject_wrong_arm_side = bool(self.get_parameter('hard_reject_wrong_arm_side').value)
+
+        self.enable_top_down_bonus = bool(self.get_parameter('enable_top_down_bonus').value)
+        self.top_down_bonus_weight = float(self.get_parameter('top_down_bonus_weight').value)
+        self.top_down_axis_index = max(0, min(2, int(self.get_parameter('top_down_axis_index').value)))
+        self.top_down_axis_sign = float(self.get_parameter('top_down_axis_sign').value)
+        self.top_down_desired_z_sign = -1.0 if float(self.get_parameter('top_down_desired_z_sign').value) < 0.0 else 1.0
+        self.top_down_penalize_bottom_up = bool(self.get_parameter('top_down_penalize_bottom_up').value)
+        self.bottom_up_penalty_weight = float(self.get_parameter('bottom_up_penalty_weight').value)
+
+        if self.arm_side not in ('right', 'left'):
+            self.get_logger().warn(f'Unknown arm_side={self.arm_side}. Falling back to right.')
+            self.arm_side = 'right'
+        self.desired_lateral_sign = 1.0 if self.arm_side == 'right' else -1.0
+        self.gripper_face_axis_index = max(0, min(2, self.gripper_face_axis_index))
+
         self.hard_filter_to_target = bool(self.get_parameter('hard_filter_to_target').value)
         self.require_target_data = bool(self.get_parameter('require_target_data').value)
         self.target_filter_use_mask = bool(self.get_parameter('target_filter_use_mask').value)
@@ -251,6 +374,8 @@ class AnyGraspFromTopicNode(Node):
 
         self._append_sdk_path(self.sdk_root)
         self.anygrasp = self._build_anygrasp()
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self._already_processed = False
 
         self.scene_points: Optional[np.ndarray] = None
@@ -312,6 +437,18 @@ class AnyGraspFromTopicNode(Node):
         self.get_logger().info(f'use_gripper_volume_collision={self.use_gripper_volume_collision}')
         self.get_logger().info(f'min_bg_clearance={self.min_bg_clearance:.4f}')
         self.get_logger().info(f'background_collision_margin={self.background_collision_margin:.4f}')
+        self.get_logger().info(f'enable_okrobot_heuristic={self.enable_okrobot_heuristic}')
+        self.get_logger().info(f'okrobot_floor_normal_camera={self.okrobot_floor_normal_camera.tolist()}')
+        self.get_logger().info(f'okrobot_use_horizontal_theta={self.okrobot_use_horizontal_theta}')
+        self.get_logger().info(f'enable_arm_side_filter={self.enable_arm_side_filter}')
+        self.get_logger().info(f'arm_side={self.arm_side} desired_lateral_sign={self.desired_lateral_sign:+.1f}')
+        self.get_logger().info(f'arm_side_min_dot={self.arm_side_min_dot:.3f}  # deprecated/ignored')
+        self.get_logger().info(f'arm_side_reject_dot={self.arm_side_reject_dot:.3f}  # reject if side_dot < -this')
+        self.get_logger().info(f'gripper_face_axis_index={self.gripper_face_axis_index} sign={self.gripper_face_axis_sign:+.1f}')
+        self.get_logger().info(f'enable_top_down_bonus={self.enable_top_down_bonus}')
+        self.get_logger().info(f'top_down_axis_index={self.top_down_axis_index} sign={self.top_down_axis_sign:+.1f}')
+        self.get_logger().info(f'top_down_desired_z_sign={self.top_down_desired_z_sign:+.1f}  # -1 means above-to-below')
+        self.get_logger().info(f'top_down_bonus_weight={self.top_down_bonus_weight:.3f}')
 
     def _append_sdk_path(self, sdk_root: str) -> None:
         if not os.path.isdir(sdk_root):
@@ -476,6 +613,7 @@ class AnyGraspFromTopicNode(Node):
             'target_reject': 0,
             'background_reject': 0,
             'width_soft_reject': 0,
+            'arm_side_reject': 0,
             'kept': 0,
             'target_data_available': int(self.target_data_available()),
             'background_available': int(self.background_points is not None and self.background_points.shape[0] > 0),
@@ -530,32 +668,88 @@ class AnyGraspFromTopicNode(Node):
                 stats['background_reject'] += 1
                 continue
 
-            # 5) Final ranking after hard filters
-            rank = float(g.score)
-            if g.mask_ok:
-                rank += self.mask_score_bonus
-            if self.prefer_side_grasp:
-                rank += self.opening_perp_weight * g.opening_perp
-                rank += self.approach_perp_weight * g.approach_perp
-            rank += self.body_align_weight * g.body_align
-            rank += 0.5 * g.width_match
-            rank += self.radial_score_weight * g.radial_score
-            if self.prefer_mid_body:
-                rank += self.mid_score_weight * g.mid_score
-            rank += self.bg_clearance_weight * min(g.bg_clearance, 0.05)
+            # 5) Arm-side feasibility filter in final base_link orientation.
+            # Right arm: reject grasps whose gripper face axis points to robot-right (-Y).
+            # Left arm : reject grasps whose gripper face axis points to robot-left (+Y).
+            g.arm_side_ok, g.arm_side_dot = self.arm_side_feasibility(g)
+            if self.enable_arm_side_filter and self.hard_reject_wrong_arm_side and (not g.arm_side_ok):
+                stats['arm_side_reject'] += 1
+                continue
+
+            # 6) Top-down preference score in final base_link orientation.
+            # This is only a soft ranking term. It does not remove candidates.
+            g.top_down_score, g.top_down_dot = self.top_down_preference_score(g)
+
+            # 7) Final ranking after hard filters
+            # OK-Robot heuristic:
+            #   1) filter candidates by target mask/segment membership
+            #   2) select by raw graspness while penalizing non-horizontal grasps
+            # The paper writes the heuristic as S - theta^4/10. Here theta is
+            # implemented as the deviation from a horizontal side grasp by default,
+            # because that is the behavior the paper says it prefers for robustness
+            # to hand-eye calibration error.
+            g.okrobot_theta, g.okrobot_score, g.horizontal_score = self.okrobot_heuristic_score(g)
+
+            if self.enable_okrobot_heuristic:
+                rank = self.okrobot_rank_weight * g.okrobot_score
+                if self.enable_top_down_bonus:
+                    rank += self.top_down_bonus_weight * g.top_down_score
+
+                shape_rank = 0.0
+                if g.mask_ok:
+                    shape_rank += self.mask_score_bonus
+                if self.prefer_side_grasp:
+                    shape_rank += self.opening_perp_weight * g.opening_perp
+                    shape_rank += self.approach_perp_weight * g.approach_perp
+                shape_rank += self.body_align_weight * g.body_align
+                shape_rank += 0.5 * g.width_match
+                shape_rank += self.radial_score_weight * g.radial_score
+                if self.prefer_mid_body:
+                    shape_rank += self.mid_score_weight * g.mid_score
+                shape_rank += self.bg_clearance_weight * min(g.bg_clearance, 0.05)
+
+                if self.okrobot_keep_existing_shape_terms:
+                    rank += self.okrobot_shape_terms_weight * shape_rank
+                else:
+                    # Keep only very weak safety/quality preferences so that the
+                    # OK-Robot horizontal heuristic, not the older body-axis ranking,
+                    # decides the final orientation.
+                    rank += 0.05 * float(g.mask_ok)
+                    rank += 0.05 * g.width_match
+                    rank += 0.03 * min(g.bg_clearance, 0.05)
+                    if self.enable_arm_side_filter and not g.arm_side_ok:
+                        rank -= self.arm_side_filter_penalty
+            else:
+                rank = float(g.score)
+                if self.enable_top_down_bonus:
+                    rank += self.top_down_bonus_weight * g.top_down_score
+                if g.mask_ok:
+                    rank += self.mask_score_bonus
+                if self.prefer_side_grasp:
+                    rank += self.opening_perp_weight * g.opening_perp
+                    rank += self.approach_perp_weight * g.approach_perp
+                rank += self.body_align_weight * g.body_align
+                rank += 0.5 * g.width_match
+                rank += self.radial_score_weight * g.radial_score
+                if self.prefer_mid_body:
+                    rank += self.mid_score_weight * g.mid_score
+                rank += self.bg_clearance_weight * min(g.bg_clearance, 0.05)
+                if self.enable_arm_side_filter and not g.arm_side_ok:
+                    rank -= self.arm_side_filter_penalty
 
             if (not force_keep) and self.body_axis is not None:
                 if not g.width_gate_ok:
                     rank -= 4.0
                     stats['width_soft_reject'] += 1
-                if g.approach_perp < 0.45:
-                    rank -= 1.25
-                if g.opening_perp < 0.55:
-                    rank -= 1.00
-                if g.mid_score < 0.20:
-                    rank -= 0.45
-                if g.radial_score < 0.10:
-                    rank -= 0.45
+                if not self.enable_okrobot_heuristic:
+                    if g.approach_perp < 0.45:
+                        rank -= 1.25
+                    if g.opening_perp < 0.55:
+                        rank -= 1.00
+                    if g.mid_score < 0.20:
+                        rank -= 0.45
+                    if g.radial_score < 0.10:
+                        rank -= 0.45
 
             g.rank = rank
             ranked.append(g)
@@ -569,10 +763,193 @@ class AnyGraspFromTopicNode(Node):
                 f"target_reject={stats['target_reject']} "
                 f"background_reject={stats['background_reject']} "
                 f"width_soft={stats['width_soft_reject']} "
+                f"arm_side_reject={stats['arm_side_reject']} "
                 f"target_data={stats['target_data_available']} "
                 f"background_data={stats['background_available']}"
             )
         return ranked
+
+
+    @staticmethod
+    def normalize_vec(vec: np.ndarray, fallback: Optional[np.ndarray] = None) -> np.ndarray:
+        vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if vec.shape[0] != 3 or not np.all(np.isfinite(vec)):
+            if fallback is None:
+                fallback = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            return fallback.astype(np.float32)
+        n = float(np.linalg.norm(vec))
+        if n < 1e-8:
+            if fallback is None:
+                fallback = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            return fallback.astype(np.float32)
+        return (vec / n).astype(np.float32)
+
+    def okrobot_heuristic_score(self, grasp: RankedGrasp) -> Tuple[float, float, float]:
+        """
+        OK-Robot-style heuristic score.
+
+        Paper reference behavior:
+          - Project grasp points into the target mask and keep grasps inside it.
+          - Rank with S - theta^4 / 10.
+          - Prefer flat/horizontal grasps because they are more robust to
+            hand-eye calibration error than vertical grasps.
+
+        This node has already performed the mask/object hard filter before this
+        function. The remaining job here is the angle penalty.
+
+        theta returned here is in radians. With okrobot_use_horizontal_theta=True,
+        theta means deviation from a horizontal side grasp, i.e. angle between
+        approach_axis and the plane perpendicular to floor normal. Thus theta=0
+        is best. If False, theta is the literal angle to the floor normal.
+        """
+        if grasp.approach_axis is None:
+            # Fallback to the third rotation column, which is commonly the
+            # approach/normal-like axis in AnyGrasp-style frames.
+            approach = grasp.rotation_matrix[:, 2].astype(np.float32)
+        else:
+            approach = grasp.approach_axis.astype(np.float32)
+        approach = self.normalize_vec(approach, fallback=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        floor_n = self.okrobot_floor_normal_camera
+
+        cos_abs = max(-1.0, min(1.0, abs(float(np.dot(approach, floor_n)))))
+        literal_theta = math.acos(cos_abs)  # 0: parallel to floor normal, pi/2: horizontal side approach
+
+        if self.okrobot_use_horizontal_theta:
+            theta = abs((math.pi * 0.5) - literal_theta)  # 0: horizontal side approach
+        else:
+            theta = literal_theta
+
+        penalty = (theta ** self.okrobot_theta_power) / self.okrobot_theta_penalty_divisor
+        ok_score = float(grasp.score) - float(penalty)
+        horizontal_score = max(0.0, 1.0 - theta / (math.pi * 0.5))
+        return float(theta), float(ok_score), float(horizontal_score)
+
+    def top_down_preference_score(self, grasp: RankedGrasp) -> Tuple[float, float]:
+        """
+        Soft preference for grasps whose final gripper-facing axis points downward.
+
+        This is intended for objects on a shelf/table: an approach/facing direction
+        from above to below is usually safer than a bottom-up direction, because
+        bottom-up motion can collide with the supporting surface.
+
+        Returns:
+          score : [0, 1] by default, where 1 means strongly above-to-below.
+                  If top_down_penalize_bottom_up=True, the score can be negative
+                  for bottom-up directions.
+          dot   : signed alignment with desired vertical direction.
+                  +1 means desired direction, -1 means opposite direction.
+        """
+        if not self.enable_top_down_bonus:
+            return 0.0, 0.0
+
+        T_final_base = self.predict_final_pose_base_for_filter(grasp)
+        if T_final_base is None:
+            return 0.0, 0.0
+
+        axis_idx = max(0, min(2, int(self.top_down_axis_index)))
+        axis = T_final_base[:3, axis_idx].astype(np.float64) * float(self.top_down_axis_sign)
+        n = float(np.linalg.norm(axis))
+        if n < 1e-9:
+            return 0.0, 0.0
+        axis = axis / n
+
+        # base_link convention: +Z is up. desired_z_sign=-1 means above-to-below.
+        dot = float(axis[2] * self.top_down_desired_z_sign)
+        if self.top_down_penalize_bottom_up:
+            score = dot
+        else:
+            score = max(0.0, dot)
+        return float(score), float(dot)
+
+    def arm_side_feasibility(self, grasp: RankedGrasp) -> Tuple[bool, float]:
+        """
+        Check final, calibration-aligned gripper facing direction in base_link.
+
+        base_link convention assumed here:
+          +X: robot forward
+          +Y: robot left
+          +Z: up
+
+        This filter only removes the clearly wrong side.
+
+        For right arm, desired/inward side is +Y. A grasp is rejected only if
+        the face axis points clearly to -Y, i.e. dot < -arm_side_reject_dot.
+        For left arm, desired/inward side is -Y. A grasp is rejected only if
+        the face axis points clearly to +Y.
+
+        Returns:
+          ok  : True if the grasp is not clearly facing the wrong side
+          dot : signed lateral alignment. Positive is inward side, negative is wrong side.
+        """
+        if not self.enable_arm_side_filter:
+            return True, 0.0
+        T_final_base = self.predict_final_pose_base_for_filter(grasp)
+        if T_final_base is None:
+            # Do not kill all grasps if TF is not available at inference time.
+            return True, 0.0
+        axis_idx = max(0, min(2, int(self.gripper_face_axis_index)))
+        face_axis = T_final_base[:3, axis_idx].astype(np.float64) * float(self.gripper_face_axis_sign)
+        n = float(np.linalg.norm(face_axis))
+        if n < 1e-9:
+            return True, 0.0
+        face_axis = face_axis / n
+        # Dot with desired lateral direction. right arm desired/inward is +Y, left arm desired/inward is -Y.
+        # Do NOT require a positive dot. Only reject when it is clearly negative.
+        dot = float(face_axis[1] * self.desired_lateral_sign)
+        return bool(dot >= -self.arm_side_reject_dot), dot
+
+    def predict_final_pose_base_for_filter(self, grasp: RankedGrasp) -> Optional[np.ndarray]:
+        """Replicate the calibration node's pose-orientation transform for filtering only."""
+        try:
+            T_pose_in = np.eye(4, dtype=np.float64)
+            T_pose_in[:3, :3] = grasp.rotation_matrix.astype(np.float64)
+            T_pose_in[:3, 3] = grasp.translation.astype(np.float64)
+
+            t = self.resolve_base_from_gripper_for_filter()
+            if t is None:
+                return None
+            T_gripper_to_base = self.make_transform_matrix_from_tf(t)
+            T_raw_base = T_gripper_to_base @ self.T_cam_to_gripper @ T_pose_in
+            T_final_base = T_raw_base.copy()
+            if self.apply_anygrasp_pose_frame_alignment_for_filter:
+                T_final_base = T_final_base @ self.T_pose_align_y90
+                x_axis_after_y90 = T_final_base[:3, 0].copy()
+                if self.auto_flip_pose_z_180_if_x_points_down_for_filter:
+                    if x_axis_after_y90[2] < self.x_axis_downward_flip_threshold_for_filter:
+                        T_final_base = T_final_base @ self.T_pose_align_z180
+            return T_final_base
+        except Exception as exc:
+            if self.verbose_filter_log:
+                self.get_logger().warn(f'arm_side_filter transform failed: {repr(exc)}')
+            return None
+
+    def resolve_base_from_gripper_for_filter(self):
+        frames = []
+        if self.base_frame:
+            frames.append(self.base_frame)
+        for f in self.base_frame_candidates:
+            if f not in frames:
+                frames.append(f)
+        for target in frames:
+            try:
+                return self.tf_buffer.lookup_transform(
+                    target,
+                    self.gripper_frame,
+                    rclpy.time.Time(),
+                    timeout=Duration(seconds=self.tf_timeout_sec),
+                )
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def make_transform_matrix_from_tf(tf_msg) -> np.ndarray:
+        t = tf_msg.transform.translation
+        q = tf_msg.transform.rotation
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+        T[:3, 3] = np.array([t.x, t.y, t.z], dtype=np.float64)
+        return T
 
     def target_data_available(self) -> bool:
         has_mask = self.target_filter_use_mask and self.target_mask is not None and self.camera_info is not None
@@ -783,6 +1160,8 @@ class AnyGraspFromTopicNode(Node):
                 f'  #{i:02d} score={g.score:.4f} rank={g.rank:.4f} width={100.0*g.width:.2f}cm '
                 f'local_span={100.0*g.local_span:.2f}cm gate={int(g.width_gate_ok)} limit={100.0*g.local_width_limit:.2f}cm '
                 f'target={int(g.target_ok)} mask={int(g.mask_ok)} target_d={100.0*g.target_dist:.1f}cm '
+                f'ok_theta={math.degrees(g.okrobot_theta):.1f}deg ok_score={g.okrobot_score:.4f} horiz={g.horizontal_score:.3f} '
+                f'side_dot={g.arm_side_dot:.3f} top_down={g.top_down_score:.3f} top_dot={g.top_down_dot:.3f} '
                 f'body_align={g.body_align:.3f} open_perp={g.opening_perp:.3f} '
                 f'appr_perp={g.approach_perp:.3f} width_match={g.width_match:.3f} '
                 f'radial={g.radial_score:.3f} mid={g.mid_score:.3f} '
@@ -903,7 +1282,8 @@ class AnyGraspFromTopicNode(Node):
         vis_width = float(getattr(self, "visual_gripper_width", 0.10)) if bool(getattr(self, "use_fixed_visual_gripper_width", True)) else float(best.width)
         self.get_logger().info(
             f'grasps={len(grasps)} best_score={best.score:.4f} best_xyz=({t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}) '
-            f'pred_width={best.width:.4f} vis_width={vis_width:.4f} rank={best.rank:.4f}'
+            f'pred_width={best.width:.4f} vis_width={vis_width:.4f} rank={best.rank:.4f} '
+            f'ok_theta={math.degrees(best.okrobot_theta):.1f}deg ok_score={best.okrobot_score:.4f} side_dot={best.arm_side_dot:.3f}'
         )
 
     def publish_empty_markers(self, header) -> None:
