@@ -119,7 +119,7 @@ class AnyGraspMaster2Node(Node):
         # scoring / filtering
         self.declare_parameter('score_threshold', 0.05)
         self.declare_parameter('max_publish_grasps', 50)
-        self.declare_parameter('mask_filter_margin_px', 32)
+        self.declare_parameter('mask_filter_margin_px', 0)
         self.declare_parameter('local_radius', 0.035)
         self.declare_parameter('width_match_sigma', 0.03)
         self.declare_parameter('opening_perp_weight', 0.90)
@@ -155,7 +155,7 @@ class AnyGraspMaster2Node(Node):
         # IMPORTANT:
         # This is a hard reject filter, not a ranking bonus.
         # Right arm: reject grasps whose gripper face axis points to robot-right (-Y).
-        # Left arm : reject grasps whose gripper face axis points to robot-left  (+Y).
+        # Right arm : reject grasps whose gripper face axis points to robot-left  (+Y).
         # It does NOT force the gripper to look strongly toward the opposite side.
         self.declare_parameter('enable_arm_side_filter', False)
         self.declare_parameter('arm_side', 'right')  # 'right' or 'left'
@@ -252,7 +252,7 @@ class AnyGraspMaster2Node(Node):
         self.declare_parameter('require_target_data', True)
         self.declare_parameter('target_filter_use_mask', True)
         self.declare_parameter('target_filter_use_object_pc', True)
-        self.declare_parameter('target_filter_radius', 0.090)
+        self.declare_parameter('target_filter_radius', 0.035)
         self.declare_parameter('hard_reject_background', True)
         self.declare_parameter('use_gripper_volume_collision', True)
         self.declare_parameter('max_background_collision_points', 45)
@@ -514,7 +514,7 @@ class AnyGraspMaster2Node(Node):
             10,
         )
 
-        self.get_logger().info('ANYGRASP MASTER2 Node Ready (RIGHT ARM, MINIMAL RANK: raw base debug + gripper +X up/+Y object)')
+        self.get_logger().info('ANYGRASP MASTER2 Node Ready (RIGHT ARM, TARGET-ONLY CANDIDATE OUTPUT)')
         self.get_logger().info(f'start_topic={self.start_topic}')
         self.get_logger().info(f'finish_topic={self.finish_topic}')
         self.get_logger().info(f'require_background_data={self.require_background_data}')
@@ -681,7 +681,7 @@ class AnyGraspMaster2Node(Node):
             # Debug visualization: publish raw AnyGrasp candidates in base_frame
             # before any hard filters. This is intentionally independent from
             # /anygrasp_r/grasps, which still contains only surviving candidates.
-            self.publish_raw_inferred_grasp_markers_base(header, grasps)
+            self.publish_raw_inferred_grasp_markers_base(msg.header, grasps)
 
             if len(grasps) == 0:
                 self.get_logger().warn('AnyGrasp produced no grasps above score threshold.')
@@ -720,24 +720,19 @@ class AnyGraspMaster2Node(Node):
 
     def rank_grasps(self, grasps: Sequence[RankedGrasp], force_keep: bool = False) -> List[RankedGrasp]:
         """
-        Minimal ranking version.
+        1st-filter-only version.
 
-        Kept hard filters:
-          1) target/object membership
-          2) background collision
+        This node now only performs the perception-side filter:
+          1) AnyGrasp score threshold was already applied before this function.
+          2) Keep candidates whose grasp center belongs to / is near the SAM3 target object.
+          3) Do NOT remove candidates by robot-side feasibility:
+             - no background/gripper-volume collision rejection here
+             - no arm-side/front-side/bottom-up hard reject here
+             - no IK/reachability decision here
 
-        Removed from the decision path:
-          - old arm-side filter based on the wrong local z-axis
-          - old top-down/front/back/bottom-up filters based on the wrong local z-axis
-          - OK-Robot horizontal heuristic
-          - bottle/body-axis shape ranking terms
-
-        New ranking:
-          raw AnyGrasp score + gripper_r_rh_p12_rn_base axis preference
-
-        Axis preference is based on the actual gripper TF convention observed in RViz:
-          - gripper +X should point upward in base_link, because the camera is mounted along +X
-          - gripper +Y should point toward the object center, because +Y is the gripper/object-facing direction
+        The output list is sorted by perception confidence so candidates[0] remains
+        the best AnyGrasp/CALI-side candidate. The robot arm node is expected to
+        run collision checking, IK, and final selection.
         """
         stats = {
             'raw': len(grasps),
@@ -762,14 +757,17 @@ class AnyGraspMaster2Node(Node):
                 rotation_matrix=grasp.rotation_matrix.copy(),
             )
 
-            # 1) Keep only candidates near the SAM3 target/object.
-            # This is still a hard filter because otherwise the robot can grasp the shelf/background.
+            # The only hard filter kept in AnyGrasp node:
+            # candidate must be on / close to the SAM3-selected target.
             g.target_ok, g.mask_ok, g.target_dist = self.target_membership(g.translation)
-            if self.hard_filter_to_target and not g.target_ok:
+            # Strict target filtering must never be bypassed by force_keep.
+            # force_keep is only for ranking-threshold fallback, not for reviving
+            # candidates outside the SAM3 target mask.
+            if self.hard_filter_to_target and (not g.target_ok):
                 stats['target_reject'] += 1
                 continue
 
-            # 2) Compute only the geometric values needed for background collision and logging.
+            # Keep these values only for logging/debug. They are NOT used to reject.
             local_pts = self.local_object_points(g.translation)
             opening_axis, approach_axis, body_axis = self.infer_axes(g, local_pts)
             g.opening_axis = opening_axis
@@ -779,49 +777,29 @@ class AnyGraspMaster2Node(Node):
             g.local_width_limit = max(0.0, float(self.get_parameter('max_gripper_width').value) - self.width_safety_margin)
             g.width_gate_ok = True
 
-            # 3) Background obstacle hard filter.
-            # This is the only non-target safety filter kept.
-            g.bg_clearance = self.background_clearance(g.translation)
-            g.bg_collision_count = self.background_collision_count(g)
-            bg_too_close = g.bg_clearance < self.min_bg_clearance
-            bg_in_gripper = g.bg_collision_count > self.max_background_collision_points
-            if self.hard_reject_background and (bg_too_close or bg_in_gripper):
-                stats['background_reject'] += 1
-                continue
-
-            # 4) Actual end-effector axis preference.
-            # This is a ranking bonus by default, not a hard reject.
-            g.ee_axis_ok, g.ee_axis_score, g.ee_x_up_dot, g.ee_y_obj_dot = self.ee_axis_preference_score(g)
-            if self.enable_ee_axis_preference and self.hard_reject_bad_ee_axis and (not g.ee_axis_ok):
-                stats['ee_axis_reject'] += 1
-                continue
-
-            # 5) Minimal ranking: model score + correct end-effector-axis preference.
-            # No old z-axis based arm/front/bottom filters, no OK-Robot/body-axis terms.
+            # Ranking is only for ordering candidates. It is not the final execution decision.
+            # Keep AnyGrasp score dominant, and use tiny tie breakers so candidates[0]
+            # remains the strongest perception candidate.
             rank = float(g.score)
-            if self.enable_ee_axis_preference:
-                rank += self.ee_axis_bonus_weight * float(g.ee_axis_score)
-
-            # Very small tie-breakers only. These should not dominate orientation.
-            rank += 0.03 * float(g.mask_ok)
-            rank += 0.02 * float(g.width_match)
-            if np.isfinite(g.bg_clearance):
-                rank += 0.01 * min(float(g.bg_clearance), 0.05)
+            rank += 0.001 * float(g.mask_ok)
+            if np.isfinite(g.target_dist):
+                rank -= 0.0005 * float(g.target_dist)
 
             g.rank = float(rank)
             ranked.append(g)
 
+        ranked.sort(key=lambda x: x.rank, reverse=True)
         stats['kept'] = len(ranked)
         self.last_filter_stats = stats
+
         if self.verbose_filter_log:
             self.get_logger().info(
-                '[filter_minimal] '
+                '[filter_target_only] '
                 f"raw={stats['raw']} kept={stats['kept']} "
                 f"target_reject={stats['target_reject']} "
-                f"background_reject={stats['background_reject']} "
-                f"ee_axis_reject={stats['ee_axis_reject']} "
                 f"target_data={stats['target_data_available']} "
-                f"background_data={stats['background_available']}"
+                f"background_data={stats['background_available']} "
+                'robot_collision_ik_selection=delegated_to_arm_node'
             )
         return ranked
 
@@ -1066,7 +1044,7 @@ class AnyGraspMaster2Node(Node):
 
         For right arm, desired/inward side is +Y. A grasp is rejected only if
         the face axis points clearly to -Y, i.e. dot < -arm_side_reject_dot.
-        For left arm, desired/inward side is -Y. A grasp is rejected only if
+        For right arm, desired/inward side is -Y. A grasp is rejected only if
         the face axis points clearly to +Y.
 
         Returns:
@@ -1085,7 +1063,7 @@ class AnyGraspMaster2Node(Node):
         if n < 1e-9:
             return True, 0.0
         face_axis = face_axis / n
-        # Dot with desired lateral direction. right arm desired/inward is +Y, left arm desired/inward is -Y.
+        # Dot with desired lateral direction. right arm desired/inward is +Y, right arm desired/inward is -Y.
         # Do NOT require a positive dot. Only reject when it is clearly negative.
         dot = float(face_axis[1] * self.desired_lateral_sign)
         return bool(dot >= -self.arm_side_reject_dot), dot
@@ -1144,38 +1122,50 @@ class AnyGraspMaster2Node(Node):
         return T
 
     def target_data_available(self) -> bool:
+        # Strict target-mask mode:
+        # If target_filter_use_mask is enabled, the SAM3 target mask and camera_info
+        # are mandatory. object_pc alone must NOT make a candidate valid, because
+        # it can contain depth noise or background points.
         has_mask = self.target_filter_use_mask and self.target_mask is not None and self.camera_info is not None
         has_object = (
             self.target_filter_use_object_pc
             and self.object_points is not None
             and self.object_points.shape[0] > 0
         )
-        return bool(has_mask or has_object)
+        if self.target_filter_use_mask:
+            return bool(has_mask)
+        return bool(has_object)
 
     def target_membership(self, xyz: np.ndarray) -> Tuple[bool, bool, float]:
         """
         Returns: (target_ok, mask_ok, target_dist).
-        target_ok is true if the grasp contact/center belongs to the selected
-        SAM3 target by either projected mask membership or 3D object_pc proximity.
+
+        Strict SAM3 target-mask version.
+        A grasp candidate is valid only when its grasp center projects inside
+        the current SAM3 target_mask. The 3D object_pc distance is kept only
+        for logging/ranking/debug, and it must never rescue a candidate whose
+        projection is outside the target mask.
         """
         mask_ok = False
         target_dist = float('inf')
-        data_available = False
-
-        if self.target_filter_use_mask and self.target_mask is not None and self.camera_info is not None:
-            data_available = True
-            mask_ok = self.is_inside_mask(xyz)
 
         if self.target_filter_use_object_pc and self.object_points is not None and self.object_points.shape[0] > 0:
-            data_available = True
             target_dist = self.distance_to_object(xyz)
 
-        if not data_available:
-            return (not self.require_target_data), mask_ok, target_dist
+        if self.target_filter_use_mask:
+            if self.target_mask is None or self.camera_info is None:
+                return False, False, target_dist
+            mask_ok = self.is_inside_mask(xyz)
+            if not mask_ok:
+                return False, False, target_dist
+            return True, True, target_dist
 
-        object_ok = target_dist <= self.target_filter_radius
-        target_ok = bool(mask_ok or object_ok)
-        return target_ok, mask_ok, target_dist
+        # Mask filtering disabled: fall back to object_pc distance only.
+        if self.target_filter_use_object_pc and self.object_points is not None and self.object_points.shape[0] > 0:
+            object_ok = target_dist <= self.target_filter_radius
+            return bool(object_ok), False, target_dist
+
+        return (not self.require_target_data), False, target_dist
 
     def distance_to_object(self, xyz: np.ndarray) -> float:
         if self.object_points is None or self.object_points.shape[0] == 0:
@@ -1192,14 +1182,12 @@ class AnyGraspMaster2Node(Node):
         h, w = self.target_mask.shape
         if not (0 <= u < w and 0 <= v < h):
             return False
-        if self.target_mask[v, u]:
-            return True
-        m = self.mask_filter_margin_px
-        x1 = max(0, u - m)
-        x2 = min(w, u + m + 1)
-        y1 = max(0, v - m)
-        y2 = min(h, v + m + 1)
-        return bool(np.any(self.target_mask[y1:y2, x1:x2]))
+
+        # Strict mask check: do not accept candidates near the mask boundary.
+        # A candidate must project onto a pixel that is actually inside target_mask.
+        # This prevents object_pc/background noise from keeping grasps outside
+        # the SAM3-selected object.
+        return bool(self.target_mask[v, u])
 
     def project_point(self, xyz: np.ndarray) -> Tuple[Optional[int], Optional[int]]:
         if self.camera_info is None:
@@ -1539,6 +1527,7 @@ class AnyGraspMaster2Node(Node):
         pose_array.poses = [self.to_pose(g.translation, g.rotation_matrix) for g in grasps]
         self.grasps_pub.publish(pose_array)
 
+
         best = grasps[0]
         best_pose = PoseStamped()
         best_pose.header = header
@@ -1821,6 +1810,10 @@ class AnyGraspMaster2Node(Node):
             return
         if self.require_target_data and (self.object_points is None or self.object_points.shape[0] == 0):
             return
+        if self.target_filter_use_mask and (self.target_mask is None or self.camera_info is None):
+            # Do not run AnyGrasp before the SAM3 target mask arrives.
+            # Otherwise all candidates may be rejected or stale masks may be used.
+            return
         if self.require_background_data and (self.background_points is None or self.background_points.shape[0] == 0):
             return
         self.run_inference(self.header)
@@ -1894,6 +1887,9 @@ class AnyGraspMaster2Node(Node):
             return
         if self.require_target_data and (self.object_points is None or self.object_points.shape[0] == 0):
             self.get_logger().warn('Waiting object_pc before AnyGrasp inference.')
+            return
+        if self.target_filter_use_mask and (self.target_mask is None or self.camera_info is None):
+            self.get_logger().warn('Waiting target_mask/camera_info before AnyGrasp inference.')
             return
         if self.require_background_data and (self.background_points is None or self.background_points.shape[0] == 0):
             self.get_logger().warn('Waiting background_pc before AnyGrasp inference.')

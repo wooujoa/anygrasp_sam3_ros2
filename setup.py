@@ -22,7 +22,6 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'anygrasp_from_topic_node = anygrasp_sam3_ros2.anygrasp_from_topic_node:main',
             'anygrasp = anygrasp_sam3_ros2.anygrasp:main',
             'anygrasp_custom = anygrasp_sam3_ros2.anygrasp_custom:main',
             'ANYGRASP = anygrasp_sam3_ros2.ANYGRASP:main',
